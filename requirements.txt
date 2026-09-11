@@ -1,0 +1,6 @@
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.52.4
+Telethon==1.45.0
+python-socks[asyncio]==2.7.1
+cryptg==0.5.0.post0

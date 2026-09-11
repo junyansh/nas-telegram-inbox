@@ -1,0 +1,113 @@
+# Telegram 视频收件箱 · NAS 自托管
+
+复制 Telegram 视频消息链接，在网页粘贴并提交，视频由 NAS 自动下载到指定文件夹。支持网页设置保存位置、公开频道及账号可访问的私有频道/群组、下载队列和失败重试。
+
+适用于安装了 Docker 的飞牛 OS 和其他 Linux NAS / 服务器。不依赖固定用户名、IP、磁盘布局或远程组网软件。复制链接本身不会触发下载；提交任务后可以关闭网页和电脑。
+
+## 快速安装
+
+准备 Linux、Python 3.9+（含系统时区数据）、Docker Engine 和支持 `up --wait` 的 Docker Compose v2。安装时需要访问 Docker 镜像仓库和 PyPI，运行时需要连接 Telegram。
+
+将本仓库下载或克隆到 NAS 上用于保存应用的目录，然后在项目目录运行：
+
+```bash
+bash install.sh
+```
+
+安装向导会询问：
+
+| 设置 | 默认行为 |
+| --- | --- |
+| 下载目录 | 项目目录下的 `downloads`；可填写多个 NAS / 外接存储目录，用 `\|` 分隔 |
+| 监听地址 | `0.0.0.0`，监听全部 IPv4 网卡；也可填写本机指定网卡地址 |
+| 网页端口 | `8787`，可自行修改 |
+| UID / GID | 自动读取执行安装的用户；从 sudo 运行时优先读取原用户身份 |
+| 时区 | `UTC`，可改为需要的 IANA 时区 |
+
+直接以 root 运行时默认使用非 root 身份 `65532:65532`，也可填写有下载目录权限的普通用户 UID/GID。可先运行 `id` 查询普通用户的身份。自定义下载目录必须已存在，外接存储必须已挂载；安装器只自动创建默认的 `downloads` 目录。
+
+脚本生成本地配置、创建访问密钥、构建容器、检查真实挂载目录的写入权限，再启动服务。按提示在自己的终端输入 sudo 密码即可。没有 sudo 时，需要当前用户已经具备 Docker 和目录操作权限。
+
+完成后访问 `http://<NAS-IP>:<端口>`，填入终端显示的服务访问密钥。默认端口为 `8787`。请通过可信局域网、VPN 或配置了 HTTPS 的反向代理访问服务。
+
+重复运行安装脚本会复用配置与密钥。需要修改安装参数时运行：
+
+```bash
+bash install.sh --reconfigure
+```
+
+## 网页使用
+
+1. 在 [Telegram API development tools](https://my.telegram.org/apps) 获取自己的 API ID / API Hash，填入「Telegram 账号设置」并保存。
+2. 填写带国家区号的手机号并发送验证码；在 Telegram 官方通知中查看验证码，填入网页登录。启用了两步验证时，再按提示填写密码。
+3. 在「保存位置」选择或手动输入目录。可以填写已挂载目录下的新子文件夹，点击「保存位置」自动创建。
+4. 粘贴具体视频消息链接，每行一条，点击「加入下载队列」。
+
+网页显示的下载路径与 NAS 路径一致。支持内部磁盘和外接存储，具体位置由安装时输入的目录决定；不会假设磁盘名称或挂载点。
+
+网页只能选择安装时挂载的目录及其子目录。需要增加另一个磁盘时，运行 `bash install.sh --reconfigure`，在目录列表中同时保留原有目录并添加新目录。Docker 重新创建容器后，网页即可选择新增位置。普通网页保存位置的修改不需要重启容器。
+
+已排队任务使用提交时的目录；改变保存位置不会移动已有文件。移除挂载前应先完成或取消使用该目录的任务。外接盘重新挂载后，可运行 `docker compose up -d --force-recreate` 刷新绑定挂载。
+
+## 本地配置与可分享代码
+
+| 文件 / 目录 | 用途 | 是否提交 Git |
+| --- | --- | --- |
+| `compose.yaml` | 通用服务定义 | 是 |
+| `install.local.json` | 用户选择的目录、地址、端口和运行身份 | 否 |
+| `compose.override.yaml` | 根据本地配置生成的挂载与端口覆盖项 | 否 |
+| `data/` | Telegram 会话、API 凭证、任务数据库 | 否 |
+| `secrets/` | 服务访问密钥 | 否 |
+| `downloads/` | 默认下载文件夹 | 否 |
+
+个人配置、密钥、会话、下载文件还会被排除在 Docker 构建上下文之外。分享仓库代码时不需要带上这些文件。自定义到项目目录以外的下载位置本来就不属于仓库。
+
+`compose.override.yaml` 使用 JSON 格式保存（JSON 也是有效 YAML），Compose 会自动与 `compose.yaml` 合并。日常命令使用 `docker compose`，不要只指定 `-f compose.yaml`，否则会漏掉本地目录和端口设置。
+
+如果通过 NAS 图形化 Compose 管理界面部署，先用安装向导完成目录和密钥准备，再在本机执行 `docker compose config > compose.local.yaml`，将合并后的配置导入管理界面。该文件包含本机路径，也不应分享或提交 Git。
+
+## 下载行为
+
+- 支持公开消息链接 `https://t.me/channel/123`、私有频道/超级群组链接 `https://t.me/c/1234567890/456`，以及话题中的具体消息链接。
+- 登录账号必须能访问目标消息。不会自动加入群组；不支持邀请链接、频道首页或普通私聊链接。
+- 一条消息链接对应该消息的视频。媒体组中多条视频需分别提交；不会抓取整个频道。
+- 识别 Telegram 视频属性或 `video/*` MIME 的附件。
+- 每批最多 100 条、最多 500 条待处理；按顺序下载，相同消息和目录去重。
+- Telegram 限流后自动等待；其他错误保留原因，可手动重试。排队任务可以取消。
+- 下载先写临时文件，校验文件大小后生成完成文件；不会覆盖已有同名文件。服务重启后恢复队列，未完成文件从头重下，不支持按字节续传。
+- 页面显示最近 200 条任务，完整记录保存在 SQLite；磁盘预留 128 MB，不自动清理已下载视频。
+- 可以在网页设置 `socks5://主机:端口` 或 `http://主机:端口` 代理。容器内的 `127.0.0.1` 指容器本身，应填写容器能访问的代理地址。
+
+## 运维与备份
+
+在项目目录运行，Docker 权限不足时在命令前加 `sudo`：
+
+```bash
+docker compose ps
+docker compose logs --tail=80
+docker compose restart
+```
+
+更新代码后运行 `bash install.sh`，已有本地设置保持不变。更改已有数据的运行 UID/GID 前，需要自行迁移目录与文件权限；安装器不会递归修改已有媒体目录。
+
+停止服务：`docker compose down`，挂载的数据和视频保留。
+
+找回网页访问密钥：在自己的终端执行 `cat secrets/access_token`（权限不足时加 sudo）。网页密钥仅缓存于当前标签页的 sessionStorage。
+
+备份前先停止服务，再备份 `data/`、`secrets/`、`install.local.json` 和代码。下载视频另行备份。手机号、验证码和两步验证密码不写入配置或任务数据库；API 凭证和 Telegram 会话保存在 `data/`。会话备份等同登录凭证，应保持私密。需要撤销登录时，可在 Telegram 官方客户端「设置 → 设备」中终止服务会话。
+
+容器以非 root 身份运行，根文件系统只读，使用独立持久化目录；不挂载 Docker socket，默认内存上限 1 GB，日志自动轮转。
+
+认证、部署边界及依赖审计方法见 [安全说明](SECURITY.md)。更新后需要重新构建并创建容器，才能应用代码和依赖修复。
+
+## 测试
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt httpx==0.28.1
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+离线测试覆盖链接格式、目录限制、认证保护、任务恢复和下载结果处理，以及通用安装配置的生成与校验。真实 Telegram 下载需要完成账号登录后，用账号可访问的视频链接验证。
+
+参考：[Telegram API 凭证](https://core.telegram.org/api/obtaining_api_id)、[Telethon 客户端](https://docs.telethon.dev/en/stable/modules/client.html)、[会话持久化](https://docs.telethon.dev/en/stable/concepts/sessions.html)、[Docker Compose 配置合并](https://docs.docker.com/compose/how-tos/multiple-compose-files/merge/)。

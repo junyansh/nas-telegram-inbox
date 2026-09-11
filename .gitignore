@@ -1,0 +1,16 @@
+.venv/
+data/
+secrets/
+__pycache__/
+*.pyc
+upstream/
+
+.DS_Store
+.env
+.env.*
+install.local.json
+compose.override.yaml
+downloads/
+compose.local.yaml
+*.local.json.tmp
+compose.override.yaml.tmp
