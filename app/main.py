@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -26,6 +27,26 @@ client = None
 client_lock = asyncio.Lock()
 phone_state = None
 last_error = ''
+FLOOD_ERRORS = (errors.FloodWaitError, errors.FloodPremiumWaitError)
+active_download = ContextVar('active_download', default=None)
+
+
+class DownloadClient(TelegramClient):
+    async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+        # Telethon's file iterator uses _call for each chunk. Retrying here keeps
+        # the same request offset and the already-written part of the video.
+        while True:
+            try:
+                return await super()._call(sender, request, ordered=ordered,
+                                           flood_sleep_threshold=flood_sleep_threshold)
+            except FLOOD_ERRORS as exc:
+                job_id = active_download.get()
+                if job_id is None:
+                    raise
+                seconds = max(0, exc.seconds) + 1
+                update_job(job_id, error=error_text(exc), retry_at=time.time() + seconds)
+                await asyncio.sleep(seconds)
+                update_job(job_id, error='', retry_at=0)
 
 
 def setting():
@@ -68,6 +89,8 @@ def update_job(job_id, **values):
 
 
 def error_text(exc):
+    if isinstance(exc, errors.FloodPremiumWaitError):
+        return f'Telegram 普通账号下载限速，需等待 {exc.seconds} 秒后重试；无需重新登录'
     if isinstance(exc, errors.FloodWaitError):
         return f'Telegram 请求限流，需要等待 {exc.seconds} 秒'
     if isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError)):
@@ -97,7 +120,7 @@ async def get_client():
         if not cfg.get('api_id') or not cfg.get('api_hash'):
             raise ValueError('请先在设置中保存 Telegram API ID 和 API Hash')
         if client is None:
-            client = TelegramClient(str(DATA / 'telegram'), cfg['api_id'], cfg['api_hash'],
+            client = DownloadClient(str(DATA / 'telegram'), cfg['api_id'], cfg['api_hash'],
                                     proxy=proxy_value(cfg.get('proxy', '')), device_model='fnOS Video Inbox',
                                     connection_retries=2, request_retries=2, flood_sleep_threshold=0)
         if not client.is_connected():
@@ -177,12 +200,15 @@ async def worker():
                     db.commit()
                     if not claimed:  # The user may cancel while authorization is in flight.
                         continue
+                    context_token = active_download.set(job['id'])
                     try:
                         await download_job(job, tg)
-                    except errors.FloodWaitError as e:
+                    except FLOOD_ERRORS as e:
                         update_job(job['id'], state='queued', retry_at=time.time() + e.seconds + 2, error=error_text(e))
                     except Exception as e:
                         update_job(job['id'], state='failed', error=error_text(e))
+                    finally:
+                        active_download.reset(context_token)
                     last_error = ''
         except Exception as e:
             last_error = error_text(e)

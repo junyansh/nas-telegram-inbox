@@ -223,6 +223,59 @@ class Service(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post('jobs/job012345/retry', {})).status_code, 200)
         self.assertEqual((await self.get('jobs')).json()[0]['state'], 'queued')
 
+    async def test_premium_wait_retries_same_request_and_preserves_progress(self):
+        job = self.add_row(state='downloading')
+        m.update_job(job['id'], progress=40)
+        partial = self.root / 'partial-video'
+        partial.write_bytes(b'already-downloaded')
+        request, sender = object(), object()
+        waiting_client = object.__new__(m.DownloadClient)
+        calls = AsyncMock(side_effect=[m.errors.FloodPremiumWaitError(None, capture=3),
+                                       m.errors.FloodPremiumWaitError(None, capture=2), b'next-chunk'])
+        delays = []
+        async def sleep(seconds):
+            delays.append(seconds)
+            row = m.db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone()
+            self.assertEqual(row['state'], 'downloading')
+            self.assertEqual(row['progress'], 40)
+            self.assertIn('普通账号下载限速', row['error'])
+            self.assertEqual(partial.read_bytes(), b'already-downloaded')
+        token = m.active_download.set(job['id'])
+        try:
+            with patch.object(m.TelegramClient, '_call', calls), patch.object(m.asyncio, 'sleep', sleep):
+                result = await waiting_client._call(sender, request)
+        finally:
+            m.active_download.reset(token)
+        self.assertEqual(result, b'next-chunk')
+        self.assertEqual(delays, [4, 3])
+        self.assertEqual(calls.await_count, 3)
+        for call in calls.await_args_list:
+            self.assertEqual(call.args, (sender, request))
+        row = m.db.execute('SELECT * FROM jobs WHERE id=?', (job['id'],)).fetchone()
+        self.assertEqual(row['retry_at'], 0)
+        self.assertEqual(row['error'], '')
+
+    async def test_wait_outside_download_returns_actionable_error(self):
+        waiting_client = object.__new__(m.DownloadClient)
+        error = m.errors.FloodPremiumWaitError(None, capture=20)
+        with patch.object(m.TelegramClient, '_call', AsyncMock(side_effect=error)):
+            with self.assertRaises(m.errors.FloodPremiumWaitError):
+                await waiting_client._call(object(), object())
+        self.assertIn('20 秒', m.error_text(error))
+        self.assertNotIn('检查验证码', m.error_text(error))
+
+    async def test_download_wait_is_cancellable(self):
+        job = self.add_row(state='downloading')
+        waiting_client = object.__new__(m.DownloadClient)
+        token = m.active_download.set(job['id'])
+        try:
+            with patch.object(m.TelegramClient, '_call', AsyncMock(side_effect=m.errors.FloodWaitError(None, capture=5))), \
+                 patch.object(m.asyncio, 'sleep', AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting_client._call(object(), object())
+        finally:
+            m.active_download.reset(token)
+
 
 if __name__ == '__main__':
     unittest.main()
