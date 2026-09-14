@@ -16,7 +16,7 @@ from urllib.parse import urlparse, unquote
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, types, utils
 from python_socks import ProxyType
 
 DATA = Path(os.getenv('DATA_DIR', '/data'))
@@ -64,7 +64,7 @@ def parse_link(link):
     if parts and parts[0] == 'c':
         if len(parts) not in (3, 4) or not all(p.isdigit() and int(p) > 0 for p in parts[1:]):
             raise ValueError('私有消息链接格式不正确')
-        entity = int('-100' + parts[1])
+        entity = utils.get_peer_id(types.PeerChannel(int(parts[1])))
     else:
         if len(parts) not in (2, 3) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,}', parts[0]) or not all(p.isdigit() and int(p) > 0 for p in parts[1:]):
             raise ValueError('请复制具体消息链接；不支持邀请链接或频道首页')
@@ -128,27 +128,53 @@ async def get_client():
         return client
 
 
+def media_kind(message):
+    if not message or not getattr(message, 'document', None):
+        return None
+    return 'video' if (getattr(message, 'video', None) or
+                       (message.document.mime_type or '').startswith('video/')) else 'file'
+
+
+async def resolve_peer(tg, entity):
+    try:
+        return await tg.get_input_entity(entity)
+    except ValueError:
+        if not isinstance(entity, int):
+            raise
+        async for dialog in tg.iter_dialogs():
+            if dialog.id == entity:
+                return dialog.input_entity
+        raise ValueError('账号无法访问该频道，请先在 Telegram 中加入频道')
+
+
+class QueueFull(ValueError):
+    pass
+
+
+def enqueue(link, directory, source='manual'):
+    # Caller owns the transaction so adding a task and advancing a watch cursor
+    # are committed together. No await between checking and inserting.
+    if db.execute("SELECT 1 FROM jobs WHERE link=? AND directory=? AND state IN ('queued','downloading','done')",
+                  (link, directory)).fetchone():
+        return False
+    if db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('queued','downloading')").fetchone()[0] >= 500:
+        raise QueueFull('队列已满，等待空位后继续检查；不会跳过未入队的消息')
+    db.execute('INSERT INTO jobs(id,link,directory,state,created,source) VALUES(?,?,?,?,?,?)',
+               (secrets.token_hex(16), link, directory, 'queued', time.time(), source))
+    return True
+
+
 async def download_job(job, tg):
     entity, mid = parse_link(job['link'])
     directory = safe_dir(job['directory'])
-    if isinstance(entity, int):
-        try:
-            peer = await tg.get_input_entity(entity)
-        except ValueError:
-            # Populate channel access hashes for private channels the account has joined.
-            async for dialog in tg.iter_dialogs():
-                if dialog.id == entity:
-                    break
-            peer = await tg.get_input_entity(entity)
-    else:
-        peer = await tg.get_input_entity(entity)
+    peer = await resolve_peer(tg, entity)
     msg = await tg.get_messages(peer, ids=mid)
-    if not msg or not msg.document or not (msg.video or (msg.document.mime_type or '').startswith('video/')):
-        raise ValueError('这条消息没有可下载的视频；请复制视频所在的那条消息链接')
+    if not media_kind(msg):
+        raise ValueError('这条消息没有可下载的视频或文件附件')
     size = msg.file.size or 0
     if shutil.disk_usage(directory).free < size + 128 * 1024 * 1024:
         raise ValueError('目标磁盘剩余空间不足（预留 128 MB）')
-    name = msg.file.name or ('video' + (msg.file.ext or '.mp4'))
+    name = msg.file.name or ('attachment' + (msg.file.ext or '.bin'))
     name = re.sub(r'[^\w.\-\u4e00-\u9fff]', '_', name)[:100]
     final = directory / f'{entity}_{mid}_{job["id"][:8]}_{name}'
     partial = directory / f'.{job["id"]}.part'
@@ -215,6 +241,54 @@ async def worker():
         await asyncio.sleep(2)
 
 
+async def scan_watch(tg, watch):
+    peer = await resolve_peer(tg, watch['chat_id'])
+    messages = await tg.get_messages(peer, min_id=watch['last_id'], reverse=True, limit=100)
+    for message in sorted(messages, key=lambda m: m.id):
+        # The user can pause/remove/edit a watch while the network request runs.
+        current = db.execute('SELECT * FROM watches WHERE id=?', (watch['id'],)).fetchone()
+        if not current or not current['enabled']:
+            return
+        if message.id <= current['last_id']:
+            continue
+        kind = media_kind(message)
+        wanted = (kind == 'video' and current['videos']) or (kind == 'file' and current['files'])
+        with db:
+            if wanted:
+                directory = str(safe_dir(current['directory']))
+                link = f'https://t.me/c/{utils.resolve_id(current["chat_id"])[0]}/{message.id}'
+                enqueue(link, directory, source='频道监听：' + current['title'])
+            db.execute('UPDATE watches SET last_id=? WHERE id=?', (message.id, watch['id']))
+    with db:
+        db.execute("UPDATE watches SET error='', last_scan=?, next_scan=? WHERE id=?",
+                   (time.time(), time.time() + (2 if len(messages) >= 100 else 30), watch['id']))
+
+
+async def monitor():
+    while True:
+        watch = db.execute('SELECT * FROM watches WHERE enabled=1 AND next_scan<=? ORDER BY next_scan,id LIMIT 1',
+                           (time.time(),)).fetchone()
+        if watch:
+            try:
+                cooldown = db.execute("SELECT COALESCE(MAX(retry_at),0) FROM jobs WHERE state IN ('queued','downloading')").fetchone()[0]
+                if cooldown > time.time():
+                    await asyncio.sleep(min(5, cooldown - time.time()))
+                    continue
+                tg = await get_client()
+                if not await asyncio.wait_for(tg.is_user_authorized(), 20):
+                    raise ValueError('请登录 Telegram 后继续监听')
+                await asyncio.wait_for(scan_watch(tg, watch), 60)
+            except FLOOD_ERRORS as exc:
+                with db:
+                    db.execute('UPDATE watches SET next_scan=MAX(next_scan,?), error=? WHERE enabled=1',
+                               (time.time() + max(0, exc.seconds) + 2, error_text(exc)))
+            except Exception as exc:
+                with db:
+                    db.execute('UPDATE watches SET next_scan=?, error=? WHERE id=?',
+                               (time.time() + 30, error_text(exc), watch['id']))
+        await asyncio.sleep(2)
+
+
 @asynccontextmanager
 async def lifespan(app):
     global db, client
@@ -233,12 +307,25 @@ async def lifespan(app):
         state TEXT NOT NULL, progress REAL DEFAULT 0, error TEXT DEFAULT '',
         filename TEXT DEFAULT '', created REAL NOT NULL, retry_at REAL DEFAULT 0);
       UPDATE jobs SET state='queued', progress=0 WHERE state='downloading';
+      CREATE TABLE IF NOT EXISTS watches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL UNIQUE,
+        title TEXT NOT NULL, directory TEXT NOT NULL, videos INTEGER NOT NULL DEFAULT 1,
+        files INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
+        last_id INTEGER NOT NULL, last_scan REAL DEFAULT 0, next_scan REAL DEFAULT 0,
+        error TEXT DEFAULT '');
     ''')
+    if 'source' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
+        db.execute("ALTER TABLE jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        db.commit()
     task = asyncio.create_task(worker())
+    monitor_task = asyncio.create_task(monitor())
     yield
     task.cancel()
+    monitor_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+    with contextlib.suppress(asyncio.CancelledError):
+        await monitor_task
     if client:
         await client.disconnect()
         client = None
@@ -430,16 +517,119 @@ async def add_jobs(body: Links):
         raise ValueError('队列已满，请等待已有任务完成')
     folder = str(safe_dir(setting()['directory']))
     added = skipped = 0
-    for link, (entity, mid) in parsed:
-        canonical = f'https://t.me/c/{str(entity)[4:]}/{mid}' if isinstance(entity, int) else f'https://t.me/{entity}/{mid}'
-        if db.execute("SELECT 1 FROM jobs WHERE link=? AND directory=? AND state IN ('queued','downloading','done')", (canonical, folder)).fetchone():
-            skipped += 1
-            continue
-        db.execute('INSERT INTO jobs(id,link,directory,state,created) VALUES(?,?,?,?,?)',
-                   (secrets.token_hex(16), canonical, folder, 'queued', time.time()))
-        added += 1
-    db.commit()
+    with db:
+        for link, (entity, mid) in parsed:
+            canonical = f'https://t.me/c/{utils.resolve_id(entity)[0]}/{mid}' if isinstance(entity, int) else f'https://t.me/{entity}/{mid}'
+            if enqueue(canonical, folder):
+                added += 1
+            else:
+                skipped += 1
     return {'added': added, 'skipped': skipped}
+
+
+def parse_channel(raw):
+    raw = raw.strip()
+    if re.fullmatch(r'-100[1-9][0-9]*', raw):
+        return int(raw)
+    if raw.startswith(('http://', 'https://')):
+        url = urlparse(raw)
+        if url.hostname not in ('t.me', 'telegram.me') or url.username or url.password or url.port:
+            raise ValueError('请输入 Telegram 频道地址')
+        parts = url.path.strip('/').split('/')
+        if parts[0] == 's':
+            parts = parts[1:]
+        if parts and parts[0] == 'c':
+            if len(parts) < 2 or not re.fullmatch(r'[1-9][0-9]*', parts[1]):
+                raise ValueError('私有频道地址无效')
+            return utils.get_peer_id(types.PeerChannel(int(parts[1])))
+        raw = parts[0] if parts else ''
+    raw = raw.removeprefix('@')
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,}', raw):
+        raise ValueError('请输入 @频道用户名、频道链接或 -100 开头的频道 ID；不支持邀请链接')
+    return raw
+
+
+@app.get('/api/channels')
+async def channels():
+    tg = await get_client()
+    if not await tg.is_user_authorized():
+        raise ValueError('请先登录 Telegram')
+    dialogs = await asyncio.wait_for(tg.get_dialogs(limit=200), 45)
+    return [{'id': dialog.id, 'title': dialog.name} for dialog in dialogs
+            if isinstance(dialog.entity, types.Channel)]
+
+
+class WatchCreate(BaseModel):
+    channel: str = Field(min_length=1, max_length=512)
+    directory: str = Field(default='', max_length=1024)
+    videos: bool = True
+    files: bool = True
+
+
+@app.get('/api/watches')
+async def watches():
+    return [dict(row) for row in db.execute('SELECT * FROM watches ORDER BY id')]
+
+
+@app.post('/api/watches')
+async def create_watch(body: WatchCreate):
+    if not body.videos and not body.files:
+        raise ValueError('请至少选择视频或文件')
+    directory = str(safe_dir(body.directory or setting()['directory'], create=True))
+    tg = await get_client()
+    if not await tg.is_user_authorized():
+        raise ValueError('请先登录 Telegram')
+    peer = await asyncio.wait_for(resolve_peer(tg, parse_channel(body.channel)), 45)
+    entity = await asyncio.wait_for(tg.get_entity(peer), 30)
+    if not isinstance(entity, types.Channel):
+        raise ValueError('仅支持频道和超级群组')
+    chat_id = utils.get_peer_id(entity)
+    if db.execute('SELECT 1 FROM watches WHERE chat_id=?', (chat_id,)).fetchone():
+        raise ValueError('此频道已在监听列表中')
+    latest = await asyncio.wait_for(tg.get_messages(peer, limit=1), 30)
+    last_id = latest[0].id if latest else 0
+    # Repeat after awaits so simultaneous browser requests cannot create duplicates.
+    if db.execute('SELECT COUNT(*) FROM watches').fetchone()[0] >= 50:
+        raise ValueError('最多监听 50 个频道')
+    try:
+        with db:
+            row = db.execute('INSERT INTO watches(chat_id,title,directory,videos,files,last_id) VALUES(?,?,?,?,?,?)',
+                             (chat_id, entity.title, directory, body.videos, body.files, last_id))
+    except sqlite3.IntegrityError:
+        raise ValueError('此频道已在监听列表中')
+    return {'id': row.lastrowid, 'title': entity.title, 'last_id': last_id}
+
+
+class WatchSettings(BaseModel):
+    enabled: bool | None = None
+    videos: bool | None = None
+    files: bool | None = None
+    directory: str | None = Field(default=None, max_length=1024)
+
+
+@app.post('/api/watches/{watch_id}/settings')
+async def edit_watch(watch_id: int, body: WatchSettings):
+    row = db.execute('SELECT * FROM watches WHERE id=?', (watch_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, '监听项不存在')
+    values = dict(row)
+    values.update({key: value for key, value in body.model_dump().items() if value is not None})
+    if not values['videos'] and not values['files']:
+        raise ValueError('请至少选择视频或文件')
+    values['directory'] = str(safe_dir(values['directory'], create=True))
+    with db:
+        db.execute('UPDATE watches SET directory=?,videos=?,files=?,enabled=?,next_scan=0,error=? WHERE id=?',
+                   (values['directory'], values['videos'], values['files'], values['enabled'], '', watch_id))
+    return {'ok': True}
+
+
+@app.post('/api/watches/{watch_id}/remove')
+async def remove_watch(watch_id: int):
+    with db:
+        removed = db.execute('DELETE FROM watches WHERE id=?', (watch_id,)).rowcount
+    if not removed:
+        raise HTTPException(404, '监听项不存在')
+    return {'ok': True}
 
 
 @app.get('/api/jobs')

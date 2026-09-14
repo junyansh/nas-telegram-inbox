@@ -17,8 +17,8 @@ class Links(unittest.TestCase):
             'https://t.me/Example/123': ('example', 123),
             'https://t.me/s/Example/123?single': ('example', 123),
             'https://t.me/Example/11/123': ('example', 123),
-            'https://t.me/c/123456/99': (-100123456, 99),
-            'https://t.me/c/123456/11/99?single': (-100123456, 99),
+            'https://t.me/c/123456/99': (-1000000123456, 99),
+            'https://t.me/c/123456/11/99?single': (-1000000123456, 99),
         }
         for raw, want in cases.items():
             self.assertEqual(m.parse_link(raw), want)
@@ -46,7 +46,8 @@ class Service(unittest.IsolatedAsyncioTestCase):
         self.token.write_text('x' * 43)
         self.patches = [patch.object(m, 'DATA', self.base / 'state'),
                         patch.object(m, 'ROOTS', [self.root]),
-                        patch.object(m, 'TOKEN_FILE', self.token), patch.object(m, 'worker', idle)]
+                        patch.object(m, 'TOKEN_FILE', self.token), patch.object(m, 'worker', idle),
+                        patch.object(m, 'monitor', idle)]
         for p in self.patches:
             p.start()
         m.client = None
@@ -87,7 +88,7 @@ class Service(unittest.IsolatedAsyncioTestCase):
 
     async def test_host_headers_cannot_bypass_read_authentication(self):
         for host in ['test/public', 'test/?path=', 'test/#fragment', 'test@other.example']:
-            for route in ['status', 'jobs', 'folders']:
+            for route in ['status', 'jobs', 'folders', 'watches', 'channels']:
                 with self.subTest(host=host, route=route):
                     r = await self.http.get('/api/' + route, headers={'Host': host})
                     self.assertEqual(r.status_code, 401)
@@ -102,6 +103,8 @@ class Service(unittest.IsolatedAsyncioTestCase):
             ('telegram/connect', {}),
             ('jobs', {'links': 'https://t.me/example/123'}),
             ('jobs/missing/retry', {}), ('jobs/missing/cancel', {}),
+            ('watches', {'channel': '@example'}), ('watches/1/settings', {'enabled': False}),
+            ('watches/1/remove', {}),
         ]
         with patch.object(m, 'get_client', AsyncMock()) as connect:
             for path, payload in calls:
@@ -181,6 +184,95 @@ class Service(unittest.IsolatedAsyncioTestCase):
     def media(self):
         return SimpleNamespace(document=SimpleNamespace(mime_type='video/mp4'), video=True,
                                file=SimpleNamespace(size=4, name='clip.mp4', ext='.mp4'))
+
+    def watch_row(self):
+        return m.db.execute('SELECT * FROM watches LIMIT 1').fetchone()
+
+    async def make_watch(self, **options):
+        tg = self.fake_tg()
+        tg.get_entity = AsyncMock(return_value=m.types.Channel(
+            id=1234567890, title='Test channel', photo=m.types.ChatPhotoEmpty(), date=None))
+        tg.get_messages.return_value = [SimpleNamespace(id=10)]
+        with patch.object(m, 'get_client', AsyncMock(return_value=tg)):
+            response = await self.post('watches', {'channel': '@example', **options})
+        self.assertEqual(response.status_code, 200, response.text)
+        return tg
+
+    async def test_watch_starts_now_filters_and_persists_cursor(self):
+        tg = await self.make_watch(files=False)
+        self.assertEqual(self.watch_row()['last_id'], 10)
+        self.assertEqual((await self.get('jobs')).json(), [])
+        video = self.media()
+        video.id = 11
+        attachment = SimpleNamespace(id=12, document=SimpleNamespace(mime_type='application/pdf'))
+        tg.get_messages.return_value = [video, attachment, SimpleNamespace(id=13, document=None)]
+        await m.scan_watch(tg, self.watch_row())
+        tg.get_messages.assert_awaited_with('peer', min_id=10, reverse=True, limit=100)
+        jobs = (await self.get('jobs')).json()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['link'], 'https://t.me/c/1234567890/11')
+        self.assertIn('Test channel', jobs[0]['source'])
+        await self.life.__aexit__(None, None, None)
+        self.life = m.lifespan(m.app)
+        await self.life.__aenter__()
+        self.assertEqual(self.watch_row()['last_id'], 13)
+        await m.scan_watch(tg, self.watch_row())
+        self.assertEqual(len((await self.get('jobs')).json()), 1)
+
+    async def test_watch_pause_edit_resume_and_remove(self):
+        tg = await self.make_watch()
+        target = str(self.root / 'attachments')
+        self.assertEqual((await self.post('watches/1/settings', {'enabled': False, 'directory': target})).status_code, 200)
+        tg.get_messages.return_value = [SimpleNamespace(id=11, document=SimpleNamespace(mime_type='application/pdf'))]
+        await m.scan_watch(tg, self.watch_row())
+        self.assertEqual(self.watch_row()['last_id'], 10)
+        await self.post('watches/1/settings', {'enabled': True})
+        await m.scan_watch(tg, self.watch_row())
+        self.assertEqual((await self.get('jobs')).json()[0]['directory'], target)
+        await self.post('watches/1/remove', {})
+        self.assertEqual((await self.get('watches')).json(), [])
+        self.assertEqual(len((await self.get('jobs')).json()), 1)
+
+    async def test_watch_queue_full_keeps_cursor(self):
+        tg = await self.make_watch()
+        m.db.executemany('INSERT INTO jobs(id,link,directory,state,created) VALUES(?,?,?,?,0)',
+                        [(str(i), 'https://t.me/example/'+str(i+1), str(self.root), 'queued') for i in range(500)])
+        m.db.commit()
+        video = self.media()
+        video.id = 11
+        tg.get_messages.return_value = [video]
+        with self.assertRaises(m.QueueFull):
+            await m.scan_watch(tg, self.watch_row())
+        self.assertEqual(self.watch_row()['last_id'], 10)
+        m.db.execute("UPDATE jobs SET state='done' WHERE id='0'")
+        m.db.commit()
+        await m.scan_watch(tg, self.watch_row())
+        self.assertEqual(self.watch_row()['last_id'], 11)
+
+    async def test_watch_rejects_duplicate_invalid_types_and_paths(self):
+        tg = await self.make_watch()
+        with patch.object(m, 'get_client', AsyncMock(return_value=tg)):
+            self.assertEqual((await self.post('watches', {'channel': '@example'})).status_code, 400)
+        for data in [{'videos': False, 'files': False}, {'directory': str(self.base)}]:
+            self.assertEqual((await self.post('watches/1/settings', data)).status_code, 400)
+        for raw in ['https://evil.test/example', 'https://t.me/+invite', 'https://t.me/c/0', 'https://t.me:99/example']:
+            with self.assertRaises(ValueError):
+                m.parse_channel(raw)
+        self.assertEqual(m.parse_channel('https://t.me/c/1234567890/42'), -1001234567890)
+        self.assertEqual(m.parse_channel('@example'), 'example')
+
+    async def test_download_document_attachment(self):
+        job = self.add_row()
+        tg = self.fake_tg()
+        tg.get_messages.return_value = SimpleNamespace(document=SimpleNamespace(mime_type='application/pdf'),
+            file=SimpleNamespace(size=4, name='document.pdf', ext='.pdf'))
+        async def download(msg, file, progress_callback):
+            file.write(b'test')
+        tg.download_media.side_effect = download
+        await m.download_job(job, tg)
+        stored = (await self.get('jobs')).json()[0]
+        self.assertEqual(stored['state'], 'done')
+        self.assertTrue(stored['filename'].endswith('.pdf'))
 
     async def test_download_success_and_no_overwrite(self):
         job = self.add_row()
